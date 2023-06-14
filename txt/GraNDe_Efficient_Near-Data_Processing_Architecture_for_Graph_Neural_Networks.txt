@@ -1,0 +1,1051 @@
+GraNDe: Efficient Near-Data Processing
+Architecture for Graph Neural Networks
+Sungmin Yun†, Hwayong Nam†, Jaehyun Park†, Byeongho Kim§,
+Jung Ho Ahn†,Senior Member, IEEE and Eojin Lee‡
+†Seoul National University,‡Inha University,§Samsung Electronics
+Abstract —Graph Neural Network (GNN) models have attracted attention, given their high accuracy in interpreting graph data. One of
+the primary building blocks of a GNN model is aggregation, which gathers and averages the feature vectors corresponding to the
+nodes adjacent to each node. Aggregation works by multiplying the adjacency and feature matrices. The size of both matrices exceeds
+the on-chip cache capacity for many realistic datasets, and the adjacency matrix is highly sparse. These characteristics lead to little
+data reuse, causing intensive main-memory accesses during the aggregation process. Thus, aggregation exhibits memory-intensive
+characteristics and dominates most of the total execution time.
+In this paper, we propose GraNDe, an NDP architecture that accelerates memory-intensive aggregation operations by locating NDP
+modules near DRAM datapath to exploit rank-level parallelism. GraNDe maximizes bandwidth utilization by separating the memory
+channel path with the buffer chip in between so that pre-/post-processing in the host processor and reduction in NDP modules operate
+simultaneously. By exploring the preferred data mappings of the operand matrices to DRAM ranks, we architect GraNDe to support
+adaptive matrix mapping that applies the optimal mapping for each layer depending on the dimension of the layer and the configuration
+of a memory system. We also propose adj-bundle broadcasting and re-tiling optimizations to reduce the transfer time for adjacency
+matrix data and to improve feature vector data reusability by exploiting tiling with consideration of adjacency between nodes. GraNDe
+achieves 3.01 ×and 1.69 ×on average, and up to 4.00 ×and 1.98 ×speedups of GCN aggregation over the baseline system and the
+state-of-the-art NDP architecture for GCN, respectively.
+Index Terms —Near-data processing, DRAM, graph neural networks
+✦
+1 I NTRODUCTION
+Existing neural network models (e.g., CNN, RNN, and
+Transformer [4], [6], [10], [20], [35]) demonstrate high per-
+formance for processing data expressed as vectors in a
+Euclidean space, such as image and speech data. However,
+these models are not suitable for processing non-Euclidean
+graph data, which is more complex in structure compared
+to image or speech data. Graph Neural Networks (GNNs)
+have recently emerged to process graph data.
+A GNN model receives an input graph and infers the
+meaning of the entire graph, the nodes, or the links between
+the nodes in a graph. A graph data consists of the graph
+structure and the features of nodes, which are represented as
+an adjacency matrix and a feature matrix, respectively. The
+GNN model consists of several layers, each mainly com-
+posed of a combination phase and an aggregation phase.
+The combination phase is typically implemented by a multi-
+layer perceptron (MLP). The aggregation phase gathers the
+features of adjacent nodes for each node and reduces the
+•A preliminary version of this paper was published at IEEE Computer
+Architecture Letters (CAL) [42]. This work was partly supported by
+the National Research Foundation of Korea (NRF) grant funded by
+the Korea government (MSIT) (NRF-2018R1A5A1059921 and NRF-
+2022R1F1A1062826), Institute of Information & communications Tech-
+nology Planning & Evaluation (IITP) grant funded by the Korea govern-
+ment (MSIT) [NO.2021-0-01343, Artificial Intelligence Graduate School
+Program (Seoul National University)], and the Samsung Electronics.
+Eojin Lee is the corresponding author.gathered features into a single intermediate vector through
+the element-wise average or summation.
+These two phases of the layer have different character-
+istics. The combination phase is compute-intensive, so it is
+well accelerated by traditional accelerators [15], [21]. In con-
+trast, the aggregation phase is memory-intensive in general
+because the size of the adjacency matrix and the feature
+matrix, which can exceed hundreds of GBs depending on
+the dataset, mostly do not fit in on-chip memory [2], [3].
+This characteristic continues as the graph dataset becomes
+larger [12]. Moreover, the adjacency matrices of typical GNN
+datasets are highly sparse, with a density of less than 0.01%
+for the graphs in Table 1. Therefore, the gathered feature
+vectors in the aggregation phases are rarely reused. These
+characteristics make the aggregation phase account for a
+large portion of the total execution time. So it is crucial to
+accelerate the aggregation phase. Although a large body of
+SpMM accelerators [5], [11], [26], [30], [31], [32], [39], [43]
+has been proposed, they do not focus on GNN models.
+Prior studies [7], [24], [27], [41] accelerate GNN models
+by adopting high bandwidth memory (HBM) to meet the
+memory bandwidth demand for processing aggregation.
+However, the size of the graph dataset (up to hundreds
+of GB) exceeds the capacity of HBM [12] devices. There-
+fore, a memory system with a capacity larger than that of
+HBM (e.g., a dual in-line memory module (DIMM)-based
+memory system) is required to perform GNN. Using tens or
+hundreds of GPUs (HBMs) could also cover the required
+memory capacity. However, the aggregation operation isThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 2
+TABLE 1
+The GNN datasets [12], [23]. The adjacency matrices are in the CSR format. Each feature vector consists of 256 FP32 elements.
+Dataset arxiv amazon mag products papers
+Number of nodes ( N) 169 K 410 K 736 K 2.45 M 111 M
+Number of edges 2.48 M 5.29M 11.53 M 126.17 M 3.34 B
+Dimension of an input feature vector ( d1) 128 96 128 100 128
+Number of output classes 40 22 349 47 172
+Average degree 14.7 12.9 15.7 51.5 30.1
+Adjacency matrix density 8.7E-5 3.1E-5 2.1E-5 2.1E-5 2.7E-7
+Adjacency matrix size 20.0 MB 42.7 MB 93.0 MB 1.0 GB 26.8 GB
+Feature matrix size 173.4 MB 420.1 MB 754.1 MB 2.5 GB 113.7 GB
+simple (e.g., element-wise summation) and does not require
+powerful computational units. For this reason, using nu-
+merous expensive GPUs is inefficient. Also, it is difficult to
+expect performance gain on large datasets with previous
+ASIC-based accelerator studies because of their small on-
+chip memory size.
+To solve these problems, Near-Data Processing (NDP)
+architectures for GNN [34], [45] have emerged recently,
+which simultaneously perform data access and aggregation
+operation in multiple DRAM ranks. They place processing
+units for each rank in the buffer chip to accelerate aggrega-
+tion by utilizing rank-level parallelism. The NDP architec-
+tures perform an aggregation phase through three stages
+in common. First, the host should generate instructions
+and send them to processing units (pre-processing). Second,
+the processing units decode the instructions, read feature
+vectors from the DRAM, and compute them (reduction).
+Finally, the host reads the partial sum vectors computed by
+each processing unit, performs final reduction, and writes
+them to DRAM again (post-processing).
+Prior NDP architectures focused only on accelerating the
+reduction using amplified bandwidth between a buffer chip
+and DRAM devices. Unlike reduction, pre-/post-processing
+in these architectures must use a path between the host
+and the buffer chips. A single channel shares the path
+between the host and the buffer chip, enforcing pre- and
+post-processing to be performed sequentially. When the
+number of ranks in a channel increases, the time required
+for pre-/post-processing also increases, which leads to less
+performance gains. Also, they lack consideration for DRAM
+mapping in the adjacency matrix and feature matrix, which
+decides the time spent on pre-/post-processing.
+In this paper, we propose GraNDe, a DIMM-based NDP
+architecture to accelerate the aggregation phase of GNN.
+GraNDe implements NDP modules for each DRAM rank
+in the buffer chip of DIMM. Each NDP module performs an
+aggregation operation in parallel using the feature matrix
+portion stored in the corresponding rank, reducing GNN
+execution time effectively. GraNDe locates buffers that can
+be accessed by both the host processor and NDP modules.
+These buffers separate the memory channel path to the
+host-side and DRAM-side. Using these buffers and host-
+/DRAM-side path, GraNDe performs pre-processing, post-
+processing, and reduction simultaneously, which is unable
+in prior NDP architectures. Moreover, we explore granular
+mappings of operand matrices to DRAM ranks in the ag-
+gregation phase and propose adaptive operand matrix map-
+ping. Therefore, each NDP module operates the aggregation
+phase using the preferred mapping for each layer based onthe feature vector dimension. Also, GraNDe manages the
+movement of distributed adjacency matrix data differently
+depending on each feature matrix mapping.
+We also propose two optimizations for GraNDe to im-
+prove memory bandwidth utilization and data reusability.
+To reduce the time to transmit adjacency information (adj-
+bundle) that is common to multiple ranks sequentially,
+GraNDe supports adj-bundle broadcasting that allows the
+host processor to send adj-bundle to all ranks in a channel
+simultaneously. Also, we propose a re-tiling mechanism that
+constructs tiles considering the adjacency between nodes
+and reuses the feature vector data repeated in a tile. It
+effectively decreases execution time by reducing the number
+of DRAM reads for aggregation without a costly graph
+reconstruction process.
+Our evaluation demonstrates that GraNDe accelerates
+the aggregation phase of GCN, the most representative
+model of GNN, across various graph datasets and layer
+dimensions. Using layer-by-layer optimal data mapping,
+which efficiently exploits higher memory bandwidth with
+rank-level parallelism, and applying two optimization tech-
+niques, GraNDe shows aggregation performance improve-
+ment of up to 4.00 ×and 3.01 ×on average compared to the
+baseline system using ogbn [12] and amazon [23] datasets.
+Also, including the time for combination and activation
+operation processed in the host processor, end-to-end GCN
+performance is improved up to 3.02 ×and 1.91 ×on average
+in GraNDe.
+We make the following key contributions:
+•We propose GraNDe, an NDP architecture for GNN,
+which accelerates the aggregation phase by choosing the
+most effective mapping scheme and by decoupling the
+memory channel to operate data movement and reduction
+simultaneously.
+•We propose adj-bundle broadcasting and re-tiling opti-
+mizations to improve memory bandwidth utilization and
+data reusability.
+•Our evaluation shows that GraNDe improves GCN ag-
+gregation performance up to 4.00 ×and 1.98 ×compared
+to the baseline and the state-of-the-art NDP architecture,
+respectively.
+2 G RAPH NEURAL NETWORK
+Graph Neural Network (GNN) is the deep-learning-based
+model used for analyzing graphs. It takes graph data as
+input and infers the meaning of the entire graph, the nodes,
+or the links between the nodes in the graph. Graph data
+consists of a feature matrix and an adjacency matrix. TheThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 3
+Target node Neighbor node
+Graph structure10
+602
+3 8114
+1
+59
+7NodeEdge𝑁
+Adjacency matrix𝑁Edge
+×Aggregation Combination
+𝐴×𝑋(𝑙)Activation
+𝑑𝑙
+𝑁Feature vectorΣ5
+0
+1
+3𝑑𝑙
+𝑑𝑙
+𝑑𝑙+1
+× =𝑑𝑙
+𝑁
+𝑊𝑙𝑑𝑙+1
+𝑑𝑙𝑑𝑙+1
+𝑁𝜎
+(𝐴𝑋𝑙)×𝑊𝑙𝜎
+𝐴𝑋(𝑙)𝑊𝑙)𝑋𝑙𝜎
+𝑋𝑙+1 𝐴
+Fig. 1. Graph data organization and overview of a layer in GCNs.
+Adjacency matrix ( A) expresses edge information between Nnumber of
+nodes in a graph. X(l),dl, and W(l)represent the input feature matrix,
+feature vector dimension, and weight matrix of lthlayer, respectively. σ
+indicates activation function, such as ReLU.
+feature matrix comprises the feature vectors of the nodes,
+each representing each node’s characteristics. Therefore, the
+column size of the feature matrix is determined by the
+feature vector dimension, where a larger vector dimension
+can encode a node feature in a more detailed manner. The
+adjacency matrix is a square matrix that expresses the edge
+information, where both the row index and column index
+indicate the node index. Because the adjacency matrix is
+sparse, it is expressed in a sparse format, such as CSR
+(compressed sparse row).
+The GNN models consist of several layers, and each
+layer consists of two phases: aggregation and combination.
+During aggregation, each node (target node) gathers (e.g.,
+calculates the average) the feature vectors of its neighbor
+node and generates a single feature vector through an ag-
+gregated function. Then, the aggregated individual feature
+vectors are passed through an MLP layer called a combina-
+tion phase. The result from the combination phase of each
+node goes through an activation function to produce a single
+output vector. The aggregated function and combination
+operation are slightly different for each GNN model (e.g.,
+GCN [19], GIN [40], and SAGEConv [9]). Hereafter, we will
+explain based on GCN, which is the most representative of
+GNN models [45].
+The operation of a GNN layer is expressed as follows:
+X(l+1)=σ(bA×X(l)×W(l))
+Here, bAis a normalized adjacency matrix, and X(l)and
+W(l)are the feature matrix and the weight matrix of the
+lthlayer, respectively. Hereafter, Adenotes the normalized
+adjacency matrix for simplicity. The former matrix multi-
+plication (A×X(l))corresponds to the aggregation phase.
+The latter multiplies the output value of aggregation by the
+weight matrix (A×X(l))×W(l), corresponding to the com-
+bination phase. σ(X)is an activation function (e.g., ReLU).
+00.20.40.60.81
+arxiv amazon mag productsExecution time ratioAggregation Combination ActivationFig. 2. Execution time breakdown of GCN with the evaluated
+datasets [12], [23] on Intel Xeon Gold 6138 with four memory channels
+(DDR4-2400).
+X(l+1)is used as the input feature matrix of the (l+ 1)th
+layer. As one node is only connected to less than 0.1% of
+the nodes in most graphs we target, the adjacency matrix
+is expressed in a sparse format, such as CSR (compressed
+sparse row), whereas the feature and weight matrices are
+dense. Therefore, the aggregation operation takes the form
+of sparse-dense matrix multiplication (SpMM), and the
+combination takes the form of general dense-dense matrix
+multiplication (GEMM).
+In this paper, we use realistic datasets [12], [23] de-
+scribed in Table 1 to evaluate our proposal. The datasets
+have hundreds of thousands or more nodes, millions or
+more symmetrically located (i.e., undirected) edges, and the
+density of the adjacency matrix is less than 0.1%. As the
+adjacency matrix and the feature matrix each have a size of
+100s of MBs to 100s of GBs, they cannot fit into the on-chip
+memory of the host system. Instead, they must be stored in
+the main memory.
+The aggregation phase is memory-intensive and ac-
+counts for a large portion of the total execution time. Besides
+the large sizes of the adjacency and feature matrices, the
+data of these matrices are rarely reused, meaning that the
+SpMM requires access to the main memory almost every
+time. These make the memory bandwidth determine the
+performance of the aggregation phase. As shown in Fig-
+ure 2, our experiment on a real system (Intel Xeon Gold 6138
+with four memory channels, each equipped with two DDR4-
+2400 DIMMs with two ranks per DIMM) demonstrates
+that aggregation accounts for more than two-thirds of the
+total execution time on average ( arxiv : 67%, amazon : 74%,
+mag: 64%, and products : 91%). Moreover, processing a larger
+graph can increase the portion of aggregation in execution
+time due to the memory bandwidth bottleneck. Therefore, it
+is important to accelerate the aggregation phase to improve the
+GNN performance.
+3 DIMM- BASED MEMORY SYSTEMS AND NDP
+ARCHITECTURES
+A modern main-memory system consists of one or more
+channels, each connecting a memory controller (MC) to
+one or more DIMMs. A DIMM has multiple ranks, each
+consisting of DRAM devices that operate in tandem by
+receiving the same command/address (C/A) signal. The
+DIMM for servers employs a buffer device to repeat the C/A
+signal to mitigate signal integrity issues when populating
+multiple DRAM devices. The buffer device also repeats the
+data signal if necessary.
+Because multiple ranks are connected to an MC through
+a shared datapath (forming a memory channel), only oneThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 4
+rank can occupy the datapath and transfer data at any given
+time. However, if we exploit the near-data processing (NDP)
+architecture that locates the processing unit (PU) at a buffer
+device located in the middle of the DRAM datapath [1],
+[29], multiple ranks can concurrently transfer data to the
+PU. Then, the PUs in all ranks can operate simultaneously,
+accelerating the target operation by utilizing the amplified
+internal bandwidth that is identical to the channel band-
+width multiplied by the number of ranks.
+GNNear [45] and G-NMP [34] improve GNN perfor-
+mance given their use of the DIMM-based NDP architecture.
+Similar to the existing NDP studies [16], [17], [22], [29],
+these architectures use custom instruction set architecture
+for NDP operations. The host processor generates instruc-
+tions for NDP and sends them to a PU. The PU decodes
+the instructions, generates DRAM commands, reads data
+from DRAM, and processes the GNN operation. The size
+of an NDP instruction is large as it includes the address and
+size information of the operand data for GNN. Thus, the
+command/address (C/A) path has insufficient bandwidth
+to fully utilize PUs, so these previous works proposed
+transferring NDP instructions through the data (DQ) path.
+NDP architectures mostly require pre-/post-processing,
+which is done by the host. In the case of GNN, because
+each PU produces an incomplete output feature matrix
+(e.g., partial sum or a fraction of output), post-processing
+is required to send the incomplete result to the host and
+obtain the complete output feature matrix by reduction
+or concatenation. Moreover, after post-processing, the final
+output feature matrix is used as the input feature matrix
+for the next layer, so it must be written from the host back
+to DRAM. However, as listed in Table 1, the size of the
+feature matrix is up to several hundred GBs, so it takes a
+long time to write the output matrix to DRAM. Because
+the data path of a memory channel is occupied during
+this time, sending another instruction to a PU through
+the DQ path is impossible, preventing PUs from utilizing
+the amplified bandwidth. The same problem occurs when
+reading adjacency matrix data, whose size reaches tens of
+GB, from DRAM to host for the pre-processing operation
+(i.e., generating instructions for NDP).
+Another important consideration in the NDP architec-
+ture for GNNs is operand matrix mapping on DRAM. Pre-
+vious works [34], [45] considered the data mapping of the
+feature matrix suitable for DIMMs. The operand matrices
+don’t fit in one rank due to their large size; instead, they
+must be stored over multiple ranks. GNNear partitioned a
+feature matrix horizontally and mapped each partition to
+each DIMM. G-NMP proposed an adaptive mapping that
+partitions the feature matrix vertically or horizontally de-
+pending on the feature vector dimension. However, feature
+vector mappings with finer grains must be considered for
+more efficient NDP operations. Moreover, it is necessary
+to consider the adjacency matrix mapping because it is too
+large to be stored within one rank.
+4 G RANDE: ANNDP A RCHITECTURE FOR GNN S
+We propose GraNDe, a DIMM-based NDP architecture that
+accelerates Graph Convolutional Networks. GraNDe locates
+processing units on DIMM’s buffer devices and utilizes
+MCRank 0Rank 1DIMM 0DIMM 1Buffer chipNDPmodule 0NDPmodule 1DRAMDRAMHost-pathDRAM-pathStatus updateDDR PHYPartial sumDDR. C/ADDR. DQ
+DDR PHYDDR. C/ADDR. DQRD,WR requestWeightStatus registerGP buffersC/A
+DRAM ControllerC/A, DataVector PUAdj-bundleAdj-bundle bufferDataGraNDecontrollerNDPmode
+NDPmodeFig. 3. An overview of the GraNDe architecture. A buffer chip on DIMM
+locates NDP modules for each rank, and each NDP module is mainly
+composed of a vector PU and buffers. The memory channel path is
+separated into host and DRAM paths with the buffer chip in between.
+memory-channel’s internal bandwidth to accelerate the ag-
+gregation phase of GNNs. This section describes the overall
+hardware architecture of GraNDe that fully utilizes the
+memory bandwidth. Then, we explore the data mapping
+strategies of operand matrices for NDP , including the ad-
+jacency matrix, and describe how GraNDe applies adap-
+tive mapping for each layer in the aggregation operation.
+We also propose a re-tiling technique that can effectively
+improve data reuse when performing aggregation phases,
+maximizing the performance of GraNDe. GraNDe focuses
+on inference, but it can also be applied to the backpropaga-
+tion phases of GNN training.
+4.1 Overview of the GraNDe Architecture
+GraNDe has NDP modules for each rank on the DIMM’s
+buffer chip, which can handle adaptive feature vector map-
+ping (see Figure 3). An NDP module consists of the adj-
+bundle buffer, four general purpose (GP) buffers, the status
+register, the vector processing unit (vector PU), the DRAM
+controller, the re-tiling unit, and the control unit. An adj-
+bundle buffer temporarily stores an adj-bundle, an adja-
+cency matrix portion that is read from the DRAM rank
+where it resides. Four GP buffers of the same size store the
+output feature vectors or adj-bundles from different ranks,
+behaving as double-buffers. The status register represents
+the current status of the NDP module. These buffers and
+register separate the memory-channel path from a host pro-
+cessor to NDP modules ( Host-path ) and that from the NDP
+module to DRAM devices ( DRAM-path ). The vector PU is
+composed of multiply-accumulators and performs weighted
+vector summation for aggregation. The DRAM controller
+generates DRAM commands (e.g., read or write) for an NDP
+operation, and the control unit manages each component to
+operate according to the aggregation execution flow.
+GraNDe maximizes the utilization of amplified band-
+width during the aggregation phase by exploiting the Host-
+path and the DRAM-path simultaneously. GraNDe places
+the buffers between Host-path and DRAM-path , which can
+be accessed by both host and DRAM in the NDP module;
+details of how the host accesses the buffers in the NDP
+module are described in Section 6. Thereby, GraNDe enables
+NDP modules to perform the reduction in DRAM-path ,
+simultaneously with the pre-/post-processing operations inThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 5
+Operation in
+each PU
+(SpMM )Data stored in
+each rankOperation in
+each PU
+(SpMM )Data stored in
+each rankMC
+Rank 0 Rank 1DIMM 0Channel 0 Channel 1
+Rank 2 Rank 3DIMM 1
+Rank 4 Rank 5 Rank 6 Rank 7DIMM 3 DIMM 2
+× × × × × × × ×
+MC
+Rank 0 Rank 1DIMM 0Channel 0 Channel 1
+Rank 2 Rank 3DIMM 1
+Rank 4 Rank 5 Rank 6 Rank 7DIMM 3 DIMM 2
+× × × × × × × ×MC
+Rank 0 Rank 1DIMM 0Channel 0 Channel 1
+Rank 2 Rank 3DIMM 1
+Rank 4 Rank 5 Rank 6 Rank 7DIMM 3 DIMM 2
+× × × × × × × ×
+MC
+Rank 0 Rank 1DIMM 0Channel 0 Channel 1
+Rank 2 Rank 3DIMM 1
+Rank 4 Rank 5 Rank 6 Rank 7DIMM 3 DIMM 2
+× × × × × × ×Summation Concatenation and summation Post-processing
+in the host
+(a) Rank -pod mapping (b) DIMM -pod mapping
+(c) Channel -pod mapping (d)System -pod mappingConcatenation and summation Concatenation Post-processing
+in the host: Inter -rank data transferFeature matrix
+Output feature matrix Adjacency matrix×Feature vector
+Fig. 4. Feature matrix mapping methods and SpMM (multiplying adjacency matrix and feature matrix) operation flow of (a) rank-pod, (b) DIMM-pod,
+(c) channel-pod, and (d) system-pod mapping. The adjacency matrix is partitioned vertically to minimize inter-rank data transfer. The type of post-
+processing in the host differs in each mapping.
+the host processor using Host-path . Also, GraNDe supports
+aggregation operations for various data mappings, and
+exploits adaptive data mapping that switches between the
+data mappings for each layer. We describe the operation for
+each data mapping in the following section.
+4.2 Exploring Data Mapping for GraNDe
+The operand matrices can be partitioned and mapped to
+multiple ranks in the form advantageous to NDP instead of
+the conventional memory-interleaving. When the adjacency
+and feature matrices are distributed to multiple DRAM
+ranks, data movement among ranks is required. It is because
+each NDP module cannot calculate the output feature ma-
+trix entirely by using only the data in its rank. In GraNDe,
+adjacency matrix data would be transferred between ranks
+instead of the feature matrices because the size of the feature
+matrix is larger than the adjacency matrix in most GNN
+datasets (see Table 1).
+In the case of the feature matrix, we assort matrix parti-
+tioning and mapping as four types of feature matrix map-
+ping (rank, DIMM, channel, and system levels) depending
+on which memory-component units (hereafter, pod) store
+one feature vector entirely. A feature vector is distributed
+across the ranks in a pod, and each NDP module on each
+rank performs an aggregation phase. Therefore, the opera-
+tion of NDP modules and data movement between ranks
+vary according to the distribution of the feature matrix.
+We explore differences in the operation for the four feature
+matrix mapping types.
+Rank-pod mapping: In rank-pod mapping, the feature ma-
+trix is partitioned horizontally, where one feature vector
+is mapped to a single rank, and each matrix partition ismapped to each rank. Therefore, each NDP module per-
+forms incomplete aggregation using only the feature vectors
+allocated to the corresponding rank (Figure 4(a)) and pro-
+duces partially computed output feature vectors. Therefore,
+the host post-processes the final output feature vector by
+adding the partial sums of the output feature vectors from
+all ranks.
+System-pod mapping: When the feature matrix is parti-
+tioned vertically, each rank only has a fraction of each
+feature vector (Figure 4(d)). Thus, a pod consists of all ranks
+in the memory system. Each NDP module aggregates the
+fraction and generates a portion of the complete output fea-
+ture vector. The host performs post-processing to compute
+the final output feature vector by concatenating the result of
+each rank.
+DIMM-pod mapping, channel-pod mapping: The feature
+matrix can be partitioned both vertically and horizon-
+tally. An adjacency matrix is horizontally partitioned and
+mapped to each pod. Then each partition is vertically
+partitioned again and mapped to the rank inside the pod
+(Figure 4(b) and (c)). Partially computed output feature
+vectors are produced in each pod, and each NDP module
+in the pod calculates a portion of those vectors. The host
+reads the partial sum from all the pods and produces final
+output feature vectors through reduction. GraNDe can also
+use various pod mappings such as two-channel-pod and
+four channel-pod between channel-pod and system-pod
+mapping.
+We also explore the mapping method of the adjacency
+matrix. In DIMM-pod, channel-pod, and system-pod map-
+pings, each NDP module requires the adjacency matrix por-
+tion, which overlaps with different NDP modules. If eachThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 6
+rank stores adjacency information as much as necessary and
+hence in a duplicative manner, the required memory space
+would significantly exceed the capacity of a typical memory
+system. Especially for system-pod mapping, each rank must
+store the whole adjacency matrix. Therefore, the adjacency
+matrix is better partitioned and distributed to each rank to
+mitigate this capacity problem. In this case, an inter-rank
+data transfer is needed, where a rank receives the part of the
+adjacency matrix required for aggregation (henceforth adj-
+bundle) from other ranks. In rank-pod mapping, each rank
+stores the entire feature vectors for the part of graph nodes
+that differ from each other. Each NDP module requires
+a portion of the adjacency matrix, vertically partitioned,
+containing the corresponding node indices. Therefore, rank-
+pod mapping does not need inter-rank data transfer if the
+adjacency information of the feature vectors mapped to a
+rank is stored in the same rank. Considering these points,
+GraNDe always partitions adjacency matrices vertically and
+saves them with CSR format to minimize the costly inter-
+rank data transfer and avoid capacity issues.
+The appropriate feature vector mapping for NDP differs
+depending on the feature vector dimension. With the rank-
+pod mapping (also DIMM- and channel-pod mappings),
+a load imbalance occurs in the number of feature vectors
+processed by NDP modules of each rank, exacerbating
+execution time. When performing the aggregation phase
+with system-pod mapping, the number of feature vectors
+processed in each rank is identical, so load balancing is not
+an issue. Instead, if the dimension of the feature vector is
+small, the size of the feature vector fraction stored in each
+rank could become smaller than the DRAM read granularity
+(e.g., 64 bytes in DDR5), so the remaining portion of the
+DRAM read data is not involved in aggregation. Also,
+system-pod mapping involves a lot of adj-bundle transfer to
+perform aggregation. Load imbalance is exacerbated in the
+order of system-, channel-, DIMM-, and rank-pod mapping,
+whereas DRAM bandwidth waste intensifies in the opposite
+order. Considering these trade-offs, GraNDe supports multiple
+pod mapping and selects the better-performing mapping strategies
+depending on the dimension of a layer adaptively .
+4.3 Execution Flow
+GNN initialization: During initialization, input operand
+matrices are loaded into DRAM using the proper mapping
+for GraNDe. The adjacency matrix is vertically partitioned
+and distributed to each rank, and the feature matrix is
+partitioned and mapped according to the feature vector
+dimension of the first layer. The weight matrix is only used
+in the combination phase, which is not the target of GraNDe,
+so it is distributed across multiple ranks with ordinary
+memory interleaving.
+Prior systems for processing GNN: Figure 5 presents each
+timing diagram when we perform aggregation on a baseline
+system without NDP architecture, previous NDP architec-
+tures [34], [45], and GraNDe. We assume that the system
+equips only two ranks through one memory channel for the
+following explanation. In the baseline system, the host pro-
+cessor reads both adjacency and input feature matrix data
+required from DRAM and performs aggregation operations.
+In this case, the host can read data from only one rank per
+channel at a time (see Figure 5(a)).
+Adjacency matrix Feature matrix Output feature matrix RRead WWrite
+R
+RR
+RR
+RR
+RW
+WR
+RW
+W
+(c) GraNDe using mapping without adj -bundle transferR
+RW
+WMC to NDP 0
+MC to NDP 1
+NDP 0 to Rank 0
+NDP 1 to Rank 1
+Effective
+execution time1 23 4
+5R
+RW
+W
+(a) Baseline systemR
+RW
+WR
+RMC to Rank 0
+MC to Rank 1
+Effective
+execution timeStart
+R
+R
+(b) Prior NDP architectureR
+RMC to NDP 0
+MC to NDP 1
+NDP 0 to Rank 0
+NDP 1 to Rank 1
+Effective
+execution timeR
+R
+R
+RW
+W
+W
+WR
+RSend 
+instruction
+R
+RR
+R
+R
+RR
+RSend 
+instructionW
+W
+W
+WR
+R
+RW
+WRW
+W
+R
+R
+(e) GraNDe using mapping with adj -bundle broadcastingR
+R
+R
+RR
+RR
+RR
+RR
+RRW
+WRW
+WW
+W
+W
+WR
+R
+W
+WW
+WMC to NDP 0
+MC to NDP 1
+NDP 0 to Rank 0
+NDP 1 to Rank 1
+Effective
+execution timeRW
+W
+R
+RMC to NDP 0
+MC to NDP 1
+NDP 0 to Rank 0
+NDP 1 to Rank 1
+Effective
+execution timeR
+R RW
+W
+(d) GraNDe using mapping with adj -bundle transferR
+RR
+RR
+RRW
+W
+R
+RR
+RRW
+WW
+W
+W
+WW
+WR
+RW
+W 12
+34 5
+6W
+W
+Broadcasting BroadcastingR
+RFig. 5. An exemplar aggregation operation in the baseline system, previ-
+ous NDP architectures [34], [45], and GraNDe with each pod mapping in
+a memory system with two ranks. The aggregation operation is divided
+into multiple execution windows, and the first two windows are colored
+clearly while the subsequent windows are transparent.
+In the NDP architecture, the NDP module for each rank
+can read or write data from each DRAM rank simultane-
+ously, reducing the execution time of the aggregation phase.
+Figure 5(b) depicts the execution flow of the previous NDP
+architecture. First, the host processor reads the adjacency
+matrix data, generates an instruction for NDP modules, and
+then sends the instruction to the NDP modules. The NDP
+modules receiving the instruction read the feature vectors
+simultaneously from each rank and perform aggregation.
+After NDP modules complete the operation corresponding
+to the instruction received, the host reads the result from
+each rank’s NDP module, performs post-processing, such
+as reduction or concatenation, and writes the final output
+result back to the DRAM. During this process, the DQ
+path between the MC and NDP modules is occupied by
+transactions for post-processing, so the host can neither
+read the subsequent adjacency matrix data nor send the
+instructions, delaying the following aggregation operation.
+GraNDe execution window: When GraNDe performs ag-
+gregation, it divides the total aggregation phase into multi-
+ple windows considering the size of the output buffer of
+an NDP module so that it can store all of the produced
+output feature vectors of a window. The host performs
+post-processing when each window completes. Within one
+window, the detailed execution sequence differs among the
+feature vector mappings that require inter-rank adj-bundle
+transfer (i.e., DIMM-, channel-, and system-pod mapping)
+and do not require (i.e., rank-pod mapping).
+Execution flow without adj-bundle transfer: Figure 5(c)This article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 7
+Adjacency MatrixNode 4 feature vector 
+is added to node 1, 2
+1 458 11 1
+2 4 10 2
+Feature vector read0 34589 11 120
+1
+2
+Send to host
+14811
+2035910
+Broadcasting 
+to all rank03
+145
+24910
+811
+10
+035
+14
+2910
+811Rank 0 Rank 1
+5
+00 3 5 910
+10 0 568910 1300 35 910
+3 568 0 3
+5 53 01Tile Target node Neighbor node
+(a) (b)New tile 0
+(c)Adjacency Matrix
+Feature vector readTile0New tile 0
+New tile 0
+New tile 0
+Rank 0 Rank 1 Rank 0 Rank 1Node 0feature vector 
+is added to node 0, 3, 5
+Node 
+list
+Tile listTile 0
+Fig. 6. The comparison between typical tiling and re-tiling. (a) Typical tiling groups nodes in the order of node index. (b) Re-tiling reads the adjacency
+matrix, lists nodes adjacent to each node sequentially, and makes a new tile list. (c) The new tile with the re-tiling technique has more overlapped
+nodes than typical tiling.
+shows the timing diagram of executing GraNDe with rank-
+pod mapping where the adj-bundle transfer is not needed.
+1⃝When aggregation begins, the NDP module of each rank
+reads the portion of the adjacency matrix from the DRAM
+cells in each rank and stores the adj-bundle in the adj-bundle
+buffer. 2⃝Then, the NDP modules fetch the adj-bundles
+from the adj-bundle buffer and perform aggregation. Be-
+cause the adj-bundle used by each NDP module is different,
+the time for aggregation per NDP module can be different
+from each other due to a load imbalance problem. When
+the aggregation process for a window finishes, adjacency-
+matrix read and aggregation operations for the next window
+are performed sequentially. Because DRAM-path and Host-
+path are separated, 3⃝the host reads the output feature
+vectors of the previous window from the output buffer,
+aggregates them, and 4⃝writes to the output buffers, si-
+multaneously. 5⃝Finally, the NDP module writes the final
+output feature vectors of the previous window in the output
+buffer to the DRAM cells.
+Execution flow with adj-bundle transfer: Figure 5(d)
+presents the execution flow of system-pod mapping, in
+which all ranks perform an aggregation phase with the same
+adj-bundle, so NDP modules must receive an adj-bundle
+from other ranks. 1⃝First, identically to rank-pod mapping,
+NDP modules read the adjacency matrix from DRAM cells
+and store an adj-bundle in the adj-bundle buffer. 2⃝The host
+reads the adj-bundle from the adj-bundle buffer of one rank
+and then sends it to the broadcasting buffers in all ranks
+sequentially. 3⃝The control unit fetches the adj-bundle from
+the broadcasting buffer, performs aggregation, and stores
+the output vectors in the output buffer. Concurrently, the
+host reads the adj-bundle of the next rank and sends it to
+all ranks sequentially. GraNDe stores this adj-bundle for
+the next rank in another broadcasting buffer (i.e., double-
+buffering). While the NDP module performs aggregation
+for the current window by repeating the above steps ( 1⃝,2⃝,
+and 3⃝),4⃝the host reads the output vectors of the previous
+window from the output buffer, concatenates them, and
+writes to the output buffers. Then, 5⃝each NDP module
+writes the final output feature vectors of the previous win-
+dow in the output buffer to the DRAM cells. For the DIMM-and channel-pod mappings, adj-bundle transfer is also nec-
+essary. The execution flow is equal to the explanation above,
+besides the adj-bundle is transferred only within the pod.
+If the size of the adj-bundle exceeds the buffer size
+because target nodes with many edges exist in a window,
+the NDP module processes the loaded portion of the adj-
+bundle first. Then, the module loads another portion of the
+adj-bundle and processes it. As intermediate values are all
+stored in the output buffer, the module repeats the afore-
+mentioned steps until the entire window is aggregated.
+5 O PTIMIZING GRANDE
+5.1 Adj-bundle Broadcasting
+The execution flow of system-pod mapping requires adj-
+bundle transfer to all ranks, increasing the execution time
+of the aggregation phase. In conventional memory systems,
+multiple ranks equipped with one memory channel share
+the C/A and DQ path. The path between a memory channel
+and the ranks forms a multi-drop bus structure. When an
+MC transfers a signal (i.e., command/address or data) to
+a specific memory channel, the signal travels to all of the
+connected ranks. The rank that is not the target of the signal
+drops a transferred signal. Therefore, an MC should send
+the data to each rank sequentially, even if it is the same data.
+The effect of adj-bundle transfer on performance grows as
+the number of ranks increases; the time required to send
+adj-bundles to more ranks takes longer, while the amount
+of work for each NDP module is reduced.
+We propose adj-bundle broadcasting to mitigate the effect
+of adj-bundle transfer on execution time. In system-pod
+mapping, every adj-bundle data transmitted to the broad-
+casting buffer of each NDP module is identical. If each
+rank does not drop this adj-bundle data intentionally, it can
+be written to all NDP modules in a channel at the same
+time. Therefore, we implement adj-bundle broadcasting in
+a straightforward manner as follows. If an NDP module
+receives a write command to the broadcasting buffer, it rec-
+ognizes this command as broadcasting and writes the data
+to the buffer, regardless of the target address corresponding
+to its rank. Figure 5(e) shows how adj-bundle broadcasting
+reduces the execution time of the aggregation phase. TheThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 8
+0102030405060
+48163264128 48163264128 48163264128 48163264128 48163264128
+arxiv amazon mag products papersNo re-tiling
+Re-tilingFeature vector read
+reduction rate (%)
+Tilesize
+Fig. 7. The reduction in the feature vector read when varying the tile size from 4 to 128 gradually for arxiv ,amazon ,mag,products , and papers
+dataset. Re-tiling achieves a much higher reduction rate than No re-tiling (typical tiling).
+adj-bundle broadcasting further reduces the execution time
+as more ranks are populated.
+This adj-bundle broadcasting method can also be used in
+channel-pod mapping. In DIMM-pod mapping, NDP mod-
+ules broadcast the adj-bundle without using the memory
+channel because the NDP modules in the same buffer device
+can transfer data to each other without communicating with
+the host processor.
+5.2 Re-tiling Technique
+GraNDe supports tiling for aggregation to reduce DRAM
+reads by increasing data reusability. It groups multiple
+target nodes into one tile and performs aggregation of the
+nodes in a tile together. Therefore, if different target nodes
+in a tile have the same neighbor node, the feature vector of
+that node can be reused (see Figure 6(a)).
+In GraNDe, the typical tiling method that groups the
+nodes in the order of the index is ineffective. Node indices
+are determined regardless of adjacency between nodes, so
+the nodes of consecutive indices in the sparse adjacency
+matrix have few common neighbor nodes. This character-
+istic reduces the data reusability obtained by tiling, which
+is more severe in the larger graph with a high sparsity.
+Figure 7 shows the change in DRAM read reduction for
+feature vectors in the aggregation phase with typical tiling
+when varying the tiling size. Increasing the number of nodes
+belonging to one tile increases the number of feature vectors
+reused within a tile, so the number of DRAM reads further
+reduces up to 6.66% with 128-node tiling on the arxiv .
+However, in the larger graphs, such as amazon ,mag,products ,
+and papers , the probability that target nodes in one tile have
+the common adjacent node is decreased, exhibiting less than
+1% of DRAM read reduction with tiling.
+We propose re-tiling that groups the nodes considering
+the adjacency between nodes without the reconstruction
+process of the adjacency matrix in GraNDe. The re-tiling
+operation consists of 1) creating a node list in the order of
+nodes with adjacency and 2) creating a tile list based on the
+node lists of all ranks (see Figure 6(b)). First, re-tiling units
+in each NDP module read the adjacency matrix fraction in
+each rank sequentially and fill the node list. In this process,
+nodes that were already included are not added to the list
+again. Then, the host processor reads the node lists from
+each NDP module, aggregates them, and creates a tile list by
+cutting the aggregated node list into a tiling size unit. Each
+tile consists of nodes in a different order from the index
+order of the adjacency matrix (see Figure 6(c)). The hostbroadcasts the tile list to all ranks, and each NDP module
+reads the adjacency matrix in this tile order, creates an adj-
+bundle, and performs an aggregation operation. Because re-
+tiling constructs a tile with nodes adjacent to a particular
+node, the nodes in a tile have at least one common adjacent
+node. Also, it makes the nodes in a tile more likely to be
+adjacent than tiling in index order. GraNDe performs the re-
+tiling operation in a unit of the number of nodes processed
+in one window.
+Re-tiling requires extra data structure in addition to node
+lists and tile lists. When creating a node list, the re-tiling unit
+must determine whether each node in the adjacency matrix
+is already in the node list. Therefore, GraNDe manages
+this information using a 1-bit flag per node. Because the
+adjacency matrix is vertically partitioned and stored in each
+rank, each re-tiling unit requires flag information for differ-
+ent nodes from each other, and the size of the flag structure
+for each re-tiling unit is (the number of nodes)/(the number
+of ranks)-bits. It is too large to be stored in an NDP module
+(e.g., 13.8 MB for the papers dataset), so GraNDe stores this
+flag information inside DRAM and accesses the required
+flags during the re-tiling process.
+GraNDe performs re-tiling while aggregating the first
+layer, stores the generated tile list in DRAM, and reuses
+it in the other aggregation phases within one inference as
+the adjacency matrix does not change during the inference.
+GraNDe with re-tiling can effectively reduce the number
+of DRAM reads for the aggregation phase by reading once
+the feature vector data for the repeated node inside a tile
+and reusing the data. As shown in Figure 7, the re-tiling
+technique is effective even if the graph size increases. This
+effect increases as the tiling size increases, reducing the
+number of DRAM reads up to 54.1% in the products dataset
+with a 128-tiling size. There is much more data reuse than
+typical tiling, which shows a reduction rate lower than 1%
+on the same configuration.
+6 G RANDECONTROL
+The host and the NDP modules communicate through status
+register. When the host sets the start bit of the status regis-
+ter, the NDP modules begin aggregation. While checking
+the value in the status register, the host and the NDP
+modules performs pre-/post-processing and reduction (See
+Figure 8(a))
+The host accesses the status register and buffers through
+memory-mapped I/O [17]. BIOS reserves the memory ad-
+dress space used for GraNDe in the course of booting. TheThis article has been accepted for publication in IEEE Transactions on Computers. This is the author's version which has not been fully edited and 
+content may change prior to final publication. Citation information: DOI 10.1109/TC.2023.3283677
+© 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+
+See https://www.ieee.org/publications/rights/index.html for more information.Authorized licensed use limited to: National Taipei Univ. of Technology. Downloaded on June 10,2023 at 12:19:53 UTC from IEEE Xplore.  Restrictions apply. SUBMITTED TO IEEE TRANSACTIONS OF COMPUTERS 9
+Perform aggregationPerform combinationlayerGraNDeaddress mapAdj-bundle bufferGP buffersStatus registerAdjacencymatrixFeature matrixDevice driverReserve GraNDememory space inkernel virtual addressMapping GraNDe’sphysical address to kernelvirtual address(memremap)Store adjacency matrix, feature matrix, and weightMapping kernel virtual address to user virtual address in inference thread (mmap)int* out_addrout_addr= 0x(GP buffer address)*out_addr= 875None cacheable memoryHost-side execution threadHost-path side execution flowRead adj-bundle and broadcastingPost-processing and write backGenerate tile list and broadcastingDRAM-path side execution flowWrite start bit to status reg.Check start bit in status reg.Fill adj-bundle bufferRead feature vector from DRAMWrite final resultto DRAMGenerate node listStatusregisterGP buffersPerform aggregationPerform combinationlayerWrite data to GP buffers
+DDR PHYDDR ACTout_addrDDR WRout_addrMCAdj-bundle buffer(a)(b)Polling and update statusreg.Update statusreg.BIOS
+Fig. 8. Overview of the software stack for GraNDe. With the support of the BIOS and the device driver, the host can access the buffers in the NDP
+modules in the same way as normal memory access.
+device driver maps GraNDe’s physical address to the kernel
+virtual address, and the user thread maps the kernel virtual
+address to the user virtual address. With support of BIOS
+and a device driver, the physical memory is mapped with
+the virtual address in the user thread, and the buffers and
+the status register in the NDP module are accessed like
+ordinary memory access, as shown in the Figure 8(b). The
+NDP module checks the address of the DDR command and
+determines the buffers to access.
+For adj-bundle broadcasting, the host reads an adj-
+bundle from the adj-bundle buffer of the source NDP mod-
+ule and then writes it to the broadcasting buffers of all NDP
+modules in a pod. During re-tiling, the host reads the node
+lists created by the re-tiling unit of each NDP module, makes
+a new tile list, and broadcasts it to all NDP modules. When
+the aggregation process is finished in the NDP module, the
+host reads the output buffer, performs post-processing, and
+writes the final output feature vectors to the output buffer
+of each NDP module. The NDP modules then fetch the final
+output feature vectors in the output buffer and write them
+into the DRAM cells. Because the Host-path is separated from
+theDRAM-path , adj-bundle broadcasting, making a new tile
+list, and post-processing by the host using the Host-path can
+be performed concurrently while each NDP module reads
+data from or writes data to DRAM cells with the DRAM-
+path.
+During aggregation, the MC does not have direct access
+to DRAM and can only access the buffers in the NDP mod-
+ule. As shown in Figure 3, the MC’s signals are multiplexed
+by the NDP mode signals. When operating in NDP mode,
+the signals (i.e., command, address, and data) from the MC
+cannot reach the DRAM. Therefore, the data in the DRAM
+is only modified by the NDP module during aggregation.
+Also, before starting aggregation, the host flushes feature
+matrix stored in the cache. It ensures that the matrix data
+is only stored in DRAM, maintaining data consistency be-
+tween DRAM and cache.
+10 R ELATED WORK
+Graph-aware methods: Previous studies reduced the ex-
+ecution time of aggregation by reconstructing the graph
+considering the adjacency between graph nodes to increase
+data reusability. GNNAdvisor [38] used node renumbering
+to accelerate the aggregation phase of GNN in a single
+GPU by improving data reuse. BNS-GCN [36] used graph
+partitioning to reduce traffic between GPUs in training.
+Graph partitioning is efficient if the continuous input graph
+structures are identical because the reconstructed graph can
+be reused. However, real-world graphs are frequently up-
+dated and dynamically generated [8]. As a graph becomes
+larger, the high restructuring overhead of graph partitioning
+has a more significant impact on the interference time of
+GNN. GraNDe differs from these studies in that it extracts
+adjacency information online during the tiling operation
+without graph reconstruction.
+Broadcasting interface in NDP architectures: Previous
+studies have attempted to use broadcasting in the NDP
+structure. TensorDIMM [22], an NDP architecture that accel-
+erates recommendation systems, sends its NDP instruction
+in a broadcast manner as the NDP cores in all DIMMs
+use the operands in the same memory address space in
+each rank. However, TensorDIMM does not target graph
+applications, so it does not consider broadcasting the data
+being written (e.g., post-processed data in the graph). ABC-
+DIMM [33] proposed an inter-DIMM broadcast to alleviate
+the bottleneck of communication between DIMMs in an
+NDP architecture. It writes broadcasted data to the DRAM
+cells, so its NDP modules cannot read data from the DRAM
+cells while performing the broadcasting unlike GraNDe,
+which stores the broadcasted data (e.g., adj-bundle) to the
+specific buffer in the NDP modules. Graphp [44] is another
+NDP architecture exploiting broadcasting for graph appli-
+cation, but it targets Hybrid Memory Cube (HMC), and its
+broadcasting scheme targets network-on-chip.
+11 C ONCLUSION
+We have proposed GraNDe, a DIMM-based near-data-
+processing architecture that accelerates the memory-intensive aggregation phase of Graph Neural Networks. It
+effectively exploits the amplified DRAM bandwidth offered
+by concurrently accessing the ranks in a memory channel
+and separating the memory channel path to both sides with
+the buffer chip in the middle. GraNDe supports an adaptive
+operand matrix mapping that distributes the adjacency and
+feature matrices across all ranks using a preferred mapping
+layer-by-layer according to the feature vector dimension of
+each layer. We further improved GraNDe by adopting the
+broadcasting mechanism for transferring adjacency matrix
+data to all ranks simultaneously and the re-tiling technique
+to increase the data reusability of aggregation operation
+through tiling. GraNDe improves GCN aggregation perfor-
+mance up to 4.00 ×and 1.98 ×compared to the baseline sys-
+tem and the state-of-the-art NDP architecture, respectively.
